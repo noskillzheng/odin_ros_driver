@@ -628,6 +628,16 @@ bool isUsb3OrHigher(const std::string& vendorId, const std::string& productId) {
         #else
             ROS_ERROR("Failed to get USB version information");
         #endif
+        // 容器内 apparmor 可能拦截 lsusb -v 导致拿不到版本信息；
+        // 非严格模式下按配置语义放行，而不是误判为 USB2.0 直接退出。
+        if (!g_strict_usb3_0_check) {
+            #ifdef ROS2
+                RCLCPP_WARN(rclcpp::get_logger("usb_check"), "Strict USB3.0 check disabled, continuing anyway");
+            #else
+                ROS_WARN("Strict USB3.0 check disabled, continuing anyway");
+            #endif
+            return true;
+        }
         return false;
     }
     
@@ -639,6 +649,14 @@ bool isUsb3OrHigher(const std::string& vendorId, const std::string& productId) {
         #else
             ROS_ERROR("bcdUSB field not found in lsusb output");
         #endif
+        if (!g_strict_usb3_0_check) {
+            #ifdef ROS2
+                RCLCPP_WARN(rclcpp::get_logger("usb_check"), "Strict USB3.0 check disabled, continuing anyway");
+            #else
+                ROS_WARN("Strict USB3.0 check disabled, continuing anyway");
+            #endif
+            return true;
+        }
         return false;
     }
     
@@ -836,11 +854,18 @@ std::string get_package_source_directory() {
     std::filesystem::path current_file(__FILE__);
     
     // 回溯到包根目录（包含package.xml的目录）
+    // 注意：__FILE__ 是编译期路径，部署机上源码树可能不存在；
+    // parent_path("/") 仍是 "/"，必须显式在根目录处终止，否则死循环。
     auto path = current_file.parent_path();
     while (!path.empty() && !std::filesystem::exists(path / "package.xml")) {
-        path = path.parent_path();
+        auto parent = path.parent_path();
+        if (parent == path) {
+            path.clear();
+            break;
+        }
+        path = parent;
     }
-    
+
     if (path.empty()) {
         throw std::runtime_error("Failed to locate package root directory");
     }
@@ -1288,8 +1313,7 @@ static void lidar_device_callback(const lidar_device_info_t* device, bool attach
             #endif
 
             g_usb_version_error = true;
-            system("pkill -f rviz");
-            exit(1);
+            kill(getpid(), SIGTERM);
             return;
         }
 
@@ -1396,9 +1420,13 @@ static void lidar_device_callback(const lidar_device_info_t* device, bool attach
             #else
                 ROS_ERROR("Failed to get device firmware version, potential incompatible, please upgrade device firmware and retry.");
             #endif
-            system("pkill -f rviz");
-            system("pkill -f host_sdk_sample");
-            exit(1);
+            // 致命错误的退出方式：给自己发 SIGTERM 走 signal_handler 的完整
+            // 收尾（停流、lidar_system_deinit 释放 USB）。不能用
+            // system("pkill -f host_sdk_sample")——会连带杀死命令行里含该字符串
+            // 的 tmux 服务器 / ssh 会话；也不能在 SDK 回调线程里直接 exit()——
+            // 退出清理会和 SDK 线程死锁，进程反而挂着不退。
+            kill(getpid(), SIGTERM);
+            return;
         }
         else {
             #ifdef ROS2
@@ -1435,9 +1463,8 @@ static void lidar_device_callback(const lidar_device_info_t* device, bool attach
                 #else
                     ROS_ERROR("The soc version is too low, please upgrade the device firmware to at least %d.%d.%d\n",required_firmware_version_major,required_firmware_version_minor,required_firmware_version_patch);
                 #endif
-                system("pkill -f rviz");
-                system("pkill -f host_sdk_sample");
-                exit(1);
+                kill(getpid(), SIGTERM);
+                return;
             }
         }
 
@@ -1491,9 +1518,8 @@ static void lidar_device_callback(const lidar_device_info_t* device, bool attach
                 #else
                     ROS_WARN("Device state: streaming, this should not happen, exitting...");
                 #endif
-                system("pkill -f rviz");
-                exit(1);
-                break;
+                kill(getpid(), SIGTERM);
+                return;
             case LIDAR_DEVICE_STREAM_STOPPED:
                 need_open_device = false;
                 get_calib_file = false;
@@ -2241,7 +2267,13 @@ int main(int argc, char *argv[])
 
     try {
     #ifdef ROS2
-        std::string package_path = get_package_source_directory();
+        // 优先用安装后的 share 目录（config/ 随 CMake install 一起部署），
+        // 部署机上没有源码树；开发环境下若 share 里没有配置再回退源码目录。
+        std::string package_path = get_package_path("odin_ros_driver");
+        if (!std::filesystem::exists(
+                std::filesystem::path(package_path) / "config" / "control_command.yaml")) {
+            package_path = get_package_source_directory();
+        }
         std::cout << "package_path: " << package_path << std::endl;
     #else
     	std::string package_path = get_package_share_path("odin_ros_driver");
