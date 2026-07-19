@@ -416,6 +416,11 @@ elseif(ROS_VERSION STREQUAL "ROS2")
     install(FILES package.xml
         DESTINATION share/${PROJECT_NAME}
     )
+
+    # Install helper scripts (invoked by the RMCS service on the robot)
+    install(PROGRAMS script/tmux-launch.sh
+        DESTINATION lib/${PROJECT_NAME}
+    )
     
     # Install headers
     install(DIRECTORY include/
